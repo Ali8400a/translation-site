@@ -1,0 +1,7 @@
+flask
+flask-cors
+pymupdf
+arabic-reshaper
+python-bidi
+requests
+gunicorn
