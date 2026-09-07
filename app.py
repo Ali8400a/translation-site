@@ -47,6 +47,7 @@ import os
 import subprocess
 import uuid
 import traceback
+import time
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
@@ -93,37 +94,46 @@ NUMBERED_PREFIX_RE = re.compile(r"^\d+[\.\)]\s")
 IMG_BBOX_TOL = 1.5
 
 
-def translate_text(text, target_lang):
+def translate_text(text, target_lang, retries=2):
     if not text.strip():
         return ""
-    try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
-        res = requests.get(url, params=params, timeout=30)
-        res.raise_for_status()
-        data = res.json()
-        return "".join(seg[0] for seg in data[0])
-    except Exception as e:
-        # Some hosted environments rate-limit Python's HTTP fingerprint while
-        # allowing the same public endpoint through curl. Keep the normal
-        # requests path first, then use curl as a narrow compatibility fallback.
-        print("translate_text requests error:", e)
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
+
+    for attempt in range(retries + 1):
         try:
-            command = [
-                "curl", "-L", "-sS", "--max-time", "30",
-                "--get", "--data-urlencode", f"client=gtx",
-                "--data-urlencode", "sl=auto",
-                "--data-urlencode", f"tl={target_lang}",
-                "--data-urlencode", "dt=t",
-                "--data-urlencode", f"q={text}",
-                url,
-            ]
-            raw = subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
-            data = __import__("json").loads(raw)
+            res = requests.get(url, params=params, timeout=30)
+            res.raise_for_status()
+            data = res.json()
             return "".join(seg[0] for seg in data[0])
-        except Exception as fallback_error:
-            print("translate_text fallback error:", fallback_error)
-            return ""
+        except Exception as e:
+            print(f"translate_text requests error (attempt {attempt + 1}):", e)
+            try:
+                command = [
+                    "curl", "-L", "-sS", "--max-time", "30",
+                    "--get", "--data-urlencode", "client=gtx",
+                    "--data-urlencode", "sl=auto",
+                    "--data-urlencode", f"tl={target_lang}",
+                    "--data-urlencode", "dt=t",
+                    "--data-urlencode", f"q={text}",
+                    url,
+                ]
+                raw = subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
+                data = __import__("json").loads(raw)
+                return "".join(seg[0] for seg in data[0])
+            except Exception as fallback_error:
+                print(f"translate_text fallback error (attempt {attempt + 1}):", fallback_error)
+
+        if attempt < retries:
+            time.sleep(0.8 * (attempt + 1))  # backoff قبل إعادة المحاولة
+
+    return ""
+
+
+# أقصى عدد أحرف بالطلب المجمّع الواحد (بدل عدد جمل ثابت) — يمنع فشل
+# الطلب بالكامل بسبب رابط طويل يتجاوز حدود جوجل، ويقلل عدد الطلبات
+# الفعلية عن الطريقة القديمة (40 جملة دايمًا بغض النظر عن طولها).
+MAX_BATCH_CHARS = 1500
 
 
 def translate_batch(texts, target_lang):
@@ -132,20 +142,42 @@ def translate_batch(texts, target_lang):
     if not non_empty:
         return results
 
-    for chunk_start in range(0, len(non_empty), BATCH_CHUNK):
-        chunk = non_empty[chunk_start: chunk_start + BATCH_CHUNK]
+    # تقسيم حسب طول الأحرف الفعلي بدل عدد ثابت من الجمل
+    chunks = []
+    current_chunk = []
+    current_len = 0
+    for item in non_empty:
+        item_len = len(item[1]) + len(BATCH_SEP)
+        if current_chunk and (current_len + item_len > MAX_BATCH_CHARS or len(current_chunk) >= BATCH_CHUNK):
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_len = 0
+        current_chunk.append(item)
+        current_len += item_len
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    for chunk in chunks:
         combined = BATCH_SEP.join(t for _, t in chunk)
         translated = translate_text(combined, target_lang)
-        if not translated:
-            continue
-        parts = translated.split(BATCH_SEP)
-        if len(parts) == len(chunk):
+
+        parts = translated.split(BATCH_SEP) if translated else []
+        if translated and len(parts) == len(chunk):
             for (i, _), part in zip(chunk, parts):
                 results[i] = part.strip()
         else:
-            print(f"batch split mismatch ({len(parts)} vs {len(chunk)}), falling back to individual")
+            if translated:
+                print(f"batch split mismatch ({len(parts)} vs {len(chunk)}), falling back to individual")
+            else:
+                print(f"batch translate failed entirely ({len(chunk)} items), falling back to individual")
+            # فشل الطلب المجمّع أو اختل التقسيم: نترجم كل عنصر لحاله
+            # بدل ما نخسر الفقرة كاملة
             for i, t in chunk:
                 results[i] = translate_text(t, target_lang)
+                time.sleep(0.15)  # تأخير بسيط يقلل احتمال الحظر
+
+        time.sleep(0.25)  # تأخير بسيط بين كل طلب مجمّع والثاني
+
     return results
 
 
@@ -769,3 +801,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+
